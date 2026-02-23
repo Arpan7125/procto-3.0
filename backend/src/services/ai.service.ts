@@ -78,8 +78,11 @@ The JSON object must strictly follow this exact structure:
     }
 
     return questions;
-  } catch (error) {
+  } catch (error: any) {
     console.error('Error generating questions from AI:', error);
+    if (error?.status === 429) {
+      throw new Error('API Quota Exceeded: Your Google Gemini Free Tier limits have been reached. Please wait and try again later, or use an upgraded API key.');
+    }
     throw new Error('Failed to generate questions. Please try again or refine your prompt.');
   }
 };
