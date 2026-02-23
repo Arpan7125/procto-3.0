@@ -44,6 +44,40 @@ Procto is a next-generation online assessment and proctoring platform designed f
 
 ---
 
+## 📂 Project Structure
+
+\`\`\`text
+procto-3.0/
+├── backend/
+│ ├── prisma/ # Database schema & migrations
+│ ├── src/
+│ │ ├── controllers/ # Request handlers (API logic)
+│ │ ├── middleware/ # Custom Express middlewares (Auth, etc.)
+│ │ ├── routes/ # API route definitions
+│ │ ├── services/ # Business logic (AI generation, etc.)
+│ │ ├── utils/ # Helper functions & utilities
+│ │ └── server.ts # Application entry point
+│ ├── Dockerfile # Backend container configuration
+│ └── package.json  
+│
+├── frontend/
+│ ├── src/
+│ │ ├── assets/ # Static assets (images, icons)
+│ │ ├── components/ # Reusable React components (UI elements)
+│ │ ├── lib/ # Library setups (Axios api config, etc.)
+│ │ ├── pages/ # Full page views (Dashboard, Exam, Login)
+│ │ ├── App.tsx # Main application routing
+│ │ └── main.tsx # React DOM render entry
+│ ├── Dockerfile # Frontend container configuration
+│ ├── tailwind.config.js # Tailwind CSS styling config
+│ └── vite.config.ts # Vite build configuration
+│
+├── docker-compose.yml # Local development multi-container orchestration
+└── README.md # Project documentation
+\`\`\`
+
+---
+
 ## 🚀 Getting Started
 
 ### Prerequisites
