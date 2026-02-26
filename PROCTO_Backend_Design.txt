@@ -1,0 +1,572 @@
+================================================================================
+       PROCTO 3.0 - BACKEND DESIGN DOCUMENT
+       Christ (Deemed to be University), Bangalore
+       Arpan Mukherjee (2547116) | Bhagyasree Roy (2547118) | Yanish Rai (2547158)
+================================================================================
+
+
+--------------------------------------------------------------------------------
+1. OVERVIEW
+--------------------------------------------------------------------------------
+
+PROCTO's backend is a RESTful API server built with Node.js, Express, and
+TypeScript. It follows a layered architecture that cleanly separates routing,
+business logic, and data access. The server runs on port 4000, exposes all
+endpoints under /api/v1/, and is containerized with Docker for consistent
+deployment.
+
+The backend handles four core concerns:
+  - Identity & Access Management (authentication + authorization)
+  - Academic Resource Management (courses, exams, questions)
+  - Exam Session Lifecycle (start, monitor, submit, grade)
+  - Proctoring Intelligence (violation detection, trust scoring, auto-termination)
+
+
+--------------------------------------------------------------------------------
+2. TECHNOLOGY STACK
+--------------------------------------------------------------------------------
+
+  Runtime         : Node.js with TypeScript 5.5
+  Framework       : Express.js 4.19
+  ORM             : Prisma 5.22 (PostgreSQL)
+  Database        : PostgreSQL (cloud-hosted)
+  Authentication  : JWT (jsonwebtoken) + Passport.js (Google OAuth, GitHub OAuth)
+  Validation      : Zod 3.23 (schema-first input validation)
+  Security        : Helmet, bcryptjs, express-rate-limit, CORS
+  AI Integration  : Google Generative AI (Gemini 2.0 Flash)
+  Cloud Storage   : AWS S3 (evidence screenshots), AWS Rekognition (face analysis)
+  Real-time       : Socket.io 4.7 (WebSocket infrastructure)
+  Job Queue       : BullMQ 5.12 + Redis (ioredis) for async task processing
+  Email           : Nodemailer 6.9
+  2FA             : Speakeasy (TOTP) + QRCode (authenticator setup)
+  Containerization: Docker (multi-stage build, non-root user)
+
+
+--------------------------------------------------------------------------------
+3. ARCHITECTURE PATTERN: LAYERED MVC
+--------------------------------------------------------------------------------
+
+The backend uses a 3-layer architecture:
+
+  +--------------------------------------------------+
+  |  ROUTES LAYER  (/src/routes/)                    |
+  |  Defines URL patterns, applies middleware chain  |
+  +--------------------------------------------------+
+              |
+              v
+  +--------------------------------------------------+
+  |  CONTROLLERS LAYER  (/src/controllers/)          |
+  |  Handles HTTP request/response, input validation |
+  +--------------------------------------------------+
+              |
+              v
+  +--------------------------------------------------+
+  |  SERVICES LAYER  (/src/services/)                |
+  |  Business logic, external API calls, scoring     |
+  +--------------------------------------------------+
+              |
+              v
+  +--------------------------------------------------+
+  |  DATA ACCESS LAYER  (Prisma ORM)                 |
+  |  Type-safe PostgreSQL queries via schema models  |
+  +--------------------------------------------------+
+
+Key design principles applied:
+  - Separation of Concerns: routes, logic, and data are fully decoupled
+  - Single Responsibility: each controller handles one resource domain
+  - Strategy Pattern: Passport OAuth strategies are interchangeable
+  - Soft Delete Pattern: records use deletedAt timestamp instead of hard delete
+  - Upsert Pattern: answer saves and enrollments are idempotent
+  - Middleware Pattern: auth, CORS, rate-limiting applied as composable layers
+
+
+--------------------------------------------------------------------------------
+4. FOLDER STRUCTURE
+--------------------------------------------------------------------------------
+
+  backend/
+  ├── src/
+  │   ├── server.ts              # App entry point, middleware setup, route mounting
+  │   ├── controllers/           # Request handlers (6 modules)
+  │   │   ├── auth.controller.ts
+  │   │   ├── course.controller.ts
+  │   │   ├── exam.controller.ts
+  │   │   ├── question.controller.ts
+  │   │   ├── examSession.controller.ts
+  │   │   └── ai.controller.ts
+  │   ├── routes/                # Express router definitions (6 files)
+  │   ├── services/              # Business logic layer
+  │   │   ├── ai.service.ts      # Gemini AI question generation
+  │   │   └── penalty.service.ts # Trust score calculation, auto-termination
+  │   ├── middleware/
+  │   │   └── auth.middleware.ts # JWT authentication + RBAC authorization
+  │   └── utils/
+  │       ├── passport.ts        # Google & GitHub OAuth strategy setup
+  │       └── courseCode.ts      # Unique course code generator
+  ├── prisma/
+  │   ├── schema.prisma          # All database models
+  │   └── migrations/            # Versioned schema migrations
+  └── Dockerfile                 # Multi-stage production build
+
+
+--------------------------------------------------------------------------------
+5. DATABASE SCHEMA (PRISMA MODELS)
+--------------------------------------------------------------------------------
+
+The database contains 12 core models organized around the exam lifecycle:
+
+  USER
+  ----
+  Fields    : id, email, passwordHash, role (STUDENT/FACULTY/ADMIN),
+              firstName, lastName, profilePhotoUrl, mfaSecret,
+              isVerified, isActive, lastLoginAt
+  Relations : courses (as faculty), enrollments, examSessions,
+              refreshTokens, auditLogs
+
+  COURSE
+  ------
+  Fields    : id, name, description, courseCode (auto-generated, unique)
+  Relations : faculty (User), enrollments, exams, questions
+  Note      : Course codes follow format abc-defg-hij (Google Classroom style)
+              Generated with uniqueness check and up to 10 retry attempts
+
+  ENROLLMENT
+  ----------
+  Fields    : studentId, courseId (unique pair), enrolledAt, droppedAt
+  Purpose   : Junction table linking students to courses; droppedAt enables
+              soft-removal without data loss
+
+  EXAM
+  ----
+  Fields    : id, courseId, title, description, duration, startTime, endTime,
+              status (DRAFT/SCHEDULED/ACTIVE/COMPLETED/ARCHIVED),
+              proctoringLevel
+  Relations : course, examQuestions, examSessions, examRules
+
+  EXAM RULES
+  ----------
+  Fields    : shuffleQuestions, shuffleChoices, maxAttempts (default 1),
+              negativeMarkingFactor, passThreshold,
+              allowCalculator, allowFormulaSheet,
+              maxLowSeverityEvents, maxMediumSeverityEvents,
+              maxHighSeverityEvents, autoTerminate
+  Purpose   : Per-exam configuration controlling proctoring thresholds
+
+  QUESTION
+  --------
+  Fields    : id, courseId, type (8 types), content (JSON), points,
+              difficulty, topicTags[], deletedAt
+  Types     : MULTIPLE_CHOICE, MULTIPLE_SELECT, TRUE_FALSE, SHORT_ANSWER,
+              ESSAY, FILL_BLANK, NUMERICAL, CODE
+  Note      : Content stored as JSON to accommodate flexible question structures
+              per type (options, correct answers, case sensitivity flags, etc.)
+
+  EXAM SESSION
+  ------------
+  Fields    : id, examId, studentId, status (PENDING/ACTIVE/SUBMITTED/
+              TERMINATED/INVALIDATED), startedAt, submittedAt,
+              trustScore (Float, default 100.0), ipAddress
+  Purpose   : Represents a single student attempt at an exam
+
+  ANSWER
+  ------
+  Fields    : sessionId, questionId (unique pair), response (JSON),
+              autoScore, manualScore, gradedBy
+  Note      : Stored via upsert for safe auto-save behavior
+
+  SUSPICIOUS EVENT
+  ----------------
+  Fields    : sessionId, type (8 violation types), severity (LOW/MEDIUM/HIGH),
+              timestamp, screenshotUrl, metadata
+  Violation Types:
+              FACE_NOT_DETECTED  - No face visible in webcam feed
+              MULTIPLE_FACES     - More than one person detected
+              LOOKING_AWAY       - Gaze deviation detected
+              TAB_SWITCH         - Browser tab or window switch
+              NOISE_DETECTED     - Unusual audio activity
+              SCREEN_EXIT        - Fullscreen mode exited
+              COPY_PASTE         - Clipboard events detected
+              RIGHT_CLICK        - Context menu triggered
+
+  RESULT
+  ------
+  Fields    : sessionId (1:1), totalScore, percentage, rank, percentile,
+              passStatus
+  Purpose   : Final calculated result after exam submission
+
+  REFRESH TOKEN
+  -------------
+  Fields    : token (hashed), userId, expiresAt
+  Purpose   : Secure rotation-capable refresh token storage
+
+  AUDIT LOG
+  ---------
+  Fields    : userId, action, resourceType, resourceId, ipAddress, createdAt
+  Purpose   : Immutable trail for compliance and investigation
+
+
+--------------------------------------------------------------------------------
+6. API ENDPOINTS (32 total, versioned under /api/v1/)
+--------------------------------------------------------------------------------
+
+  AUTH ENDPOINTS  (/api/v1/auth)
+  --------------------------------
+  POST   /register          Register with email + password
+  POST   /login             Login, receive JWT access + refresh tokens
+  POST   /logout            Invalidate refresh token
+  POST   /refresh           Rotate access token using refresh token
+  GET    /google            Initiate Google OAuth flow
+  GET    /google/callback   Handle Google OAuth callback
+  GET    /github            Initiate GitHub OAuth flow
+  GET    /github/callback   Handle GitHub OAuth callback
+
+  COURSE ENDPOINTS  (/api/v1/courses)
+  ------------------------------------
+  POST   /                  Create course [Faculty/Admin]
+  GET    /                  List user's courses (role-filtered)
+  GET    /:id               Get single course (enrollment-verified)
+  POST   /enroll            Enroll student via course code
+  GET    /:id/roster        Get enrolled students [Faculty/Admin]
+  DELETE /:id/students/:sid Remove student from course [Faculty/Admin]
+
+  EXAM ENDPOINTS  (/api/v1/exams)
+  --------------------------------
+  POST   /                  Create exam with optional rules [Faculty/Admin]
+  GET    /                  List exams by courseId (students see published only)
+  GET    /:id               Get exam with questions and rules
+  PUT    /:id               Update exam (blocked after exam starts)
+  DELETE /:id               Soft-delete exam (blocked if sessions exist)
+  POST   /:id/publish       Publish exam (requires at least 1 question)
+  POST   /:id/questions     Add questions to exam
+  DELETE /:id/questions/:qid Remove question from exam
+
+  QUESTION ENDPOINTS  (/api/v1/questions)
+  ----------------------------------------
+  POST   /                  Create question with type-specific validation
+  GET    /                  List by courseId; filterable by type/difficulty/tag
+  GET    /:id               Get single question
+  PUT    /:id               Update question
+  DELETE /:id               Soft-delete question
+  POST   /import            Bulk import from JSON/CSV
+
+  EXAM SESSION ENDPOINTS  (/api/v1/exam-sessions)
+  -------------------------------------------------
+  POST   /                  Start exam session [Student]
+  GET    /:id               Get session with all answers
+  POST   /:id/answers       Auto-save answers (upsert per question)
+  POST   /:id/submit        Submit exam, trigger result calculation
+
+  AI ENDPOINTS  (/api/v1/ai)
+  ---------------------------
+  POST   /generate          Generate questions via Gemini AI
+                            Body: { prompt, count (1-50), type, difficulty }
+
+
+--------------------------------------------------------------------------------
+7. AUTHENTICATION & AUTHORIZATION SYSTEM
+--------------------------------------------------------------------------------
+
+  TWO-FACTOR AUTH FLOW
+  ---------------------
+  1. Email/Password:
+     - Input validated by Zod schema
+     - Password hashed with bcryptjs (cost factor: 12)
+     - JWT access token issued (expires: 15 minutes)
+     - JWT refresh token issued (expires: 7 days), hashed before DB storage
+     - Refresh token sent as HTTP-only, SameSite=Strict, Secure cookie
+
+  2. OAuth 2.0 (Google & GitHub):
+     - Implemented via Passport.js strategy pattern
+     - On first login: user account auto-created with role inferred from state
+     - On repeat login: account linked; profile photo extracted and stored
+     - Stateless: no server sessions, JWT issued after OAuth callback
+
+  JWT TOKEN STRUCTURE
+  --------------------
+  Access Token  : { userId, role, exp }    -- signed with JWT_ACCESS_SECRET
+  Refresh Token : { userId, exp }          -- signed with JWT_REFRESH_SECRET
+
+  MIDDLEWARE CHAIN
+  -----------------
+  authenticate (auth.middleware.ts):
+    - Extracts Bearer token from Authorization header
+    - Verifies JWT signature and expiry
+    - Checks user exists and isActive=true in database
+    - Attaches { userId, role } to req object
+
+  authorize(...roles):
+    - Receives allowed role array
+    - Blocks request with 403 if req.role not in allowed list
+
+  ROLE-BASED ACCESS CONTROL
+  ---------------------------
+  STUDENT  : enroll in courses, start/submit exams, view own results
+  FACULTY  : create/manage own courses, exams, questions; view rosters
+  ADMIN    : full platform access, user management, system configuration
+
+  MFA SUPPORT (Infrastructure Ready):
+    - mfaSecret field on User model
+    - Speakeasy (TOTP) and QRCode libraries installed
+    - Full implementation pending in controllers
+
+
+--------------------------------------------------------------------------------
+8. PROCTORING PENALTY ENGINE (penalty.service.ts)
+--------------------------------------------------------------------------------
+
+  The Penalty Engine is the core intelligence layer for academic integrity.
+  It processes SuspiciousEvent records and manages the student's trust score
+  in real time during the exam session.
+
+  TRUST SCORE SYSTEM
+  -------------------
+  - Each ExamSession starts with trustScore = 100.0
+  - Score degrades as violations are recorded:
+
+      LOW severity event    =>  -2.5 points
+      MEDIUM severity event =>  -10.0 points
+      HIGH severity event   =>  -25.0 points
+      Minimum score         =>  0.0 (floor)
+
+  AUTO-TERMINATION LOGIC
+  -----------------------
+  The engine terminates a session (sets status = TERMINATED) if ANY of:
+    a) Number of LOW violations    >= maxLowSeverityEvents (from ExamRules)
+    b) Number of MEDIUM violations >= maxMediumSeverityEvents
+    c) Number of HIGH violations   >= maxHighSeverityEvents
+    d) trustScore drops below 20.0
+
+  On termination:
+    - ExamSession.status set to TERMINATED with timestamp
+    - AuditLog entry created with reason and userId
+    - Student is locked out of the exam
+
+  VIOLATION SEVERITY MAPPING
+  ---------------------------
+  HIGH   : MULTIPLE_FACES, FACE_NOT_DETECTED (sustained)
+  MEDIUM : TAB_SWITCH, SCREEN_EXIT, COPY_PASTE
+  LOW    : LOOKING_AWAY, NOISE_DETECTED, RIGHT_CLICK
+
+
+--------------------------------------------------------------------------------
+9. AI QUESTION GENERATION SERVICE (ai.service.ts)
+--------------------------------------------------------------------------------
+
+  The AI service integrates Google Generative AI (Gemini 2.0 Flash) to allow
+  faculty to auto-generate exam questions from natural language prompts.
+
+  REQUEST SCHEMA
+  ---------------
+  {
+    prompt     : string (min 3 chars)  - Topic or context description
+    count      : number (1-50)         - Number of questions to generate
+    type       : MCQ | TRUE_FALSE | SUBJECTIVE | ANY
+    difficulty : EASY | MEDIUM | HARD | ANY
+  }
+
+  GENERATION PIPELINE
+  --------------------
+  1. Faculty submits prompt via POST /api/v1/ai/generate
+  2. Validated request passed to ai.service.ts
+  3. Prompt engineered to request structured JSON response from Gemini
+  4. Gemini 2.0 Flash returns questions in JSON format
+  5. Response parsed; markdown code fences stripped
+  6. Questions returned as array with: type, options, correctAnswer,
+     difficulty, marks, explanation
+
+  ERROR HANDLING
+  ---------------
+  - 429 Quota Exceeded: detected explicitly, user-friendly message returned
+  - API key absent: fallback mock questions generated for development
+  - Parse failures: graceful degradation with error details
+
+  FALLBACK BEHAVIOR
+  ------------------
+  If GEMINI_API_KEY is not set, the service returns pre-defined mock questions
+  so development and testing can proceed without API credentials.
+
+
+--------------------------------------------------------------------------------
+10. SECURITY ARCHITECTURE
+--------------------------------------------------------------------------------
+
+  TRANSPORT & HEADERS
+  --------------------
+  - Helmet.js: sets CSP, X-Frame-Options, X-Content-Type-Options, HSTS
+  - CORS: origin whitelist from environment variable (default: localhost:5173)
+  - Credentials: cookies transmitted only to trusted origin
+  - Rate Limiting: express-rate-limit infrastructure (configured per route)
+
+  DATA SECURITY
+  --------------
+  - Passwords: bcryptjs with cost factor 12 (industry standard)
+  - Refresh Tokens: hashed before storage; token itself never persisted raw
+  - HTTP-only Cookies: refresh tokens inaccessible to JavaScript
+  - Secure Flag: applied when NODE_ENV=production
+  - SameSite=Strict: prevents CSRF via cookie injection
+
+  INPUT VALIDATION
+  -----------------
+  - All POST/PUT endpoints validated via Zod schemas
+  - Type coercion, min/max length, enum checks applied at boundary
+  - Zod errors returned as structured 400 response, not as stack traces
+
+  EXAM INTEGRITY
+  ---------------
+  - IP address recorded at session start
+  - Enrollment verified before any exam access
+  - Max attempts enforced at session creation
+  - Exam window (startTime/endTime) enforced server-side
+  - Questions optionally shuffled server-side (not client-side)
+  - Answers stored server-side (auto-save); not dependent on client submit
+
+  AUDIT TRAIL
+  ------------
+  - AuditLog records: userId, action, resourceType, resourceId, IP, timestamp
+  - Every termination event logged with reason
+  - Log is append-only (no update/delete routes for AuditLog)
+
+  INFRASTRUCTURE SECURITY
+  ------------------------
+  - Docker: multi-stage build reduces image surface
+  - Docker: non-root user (procto:procto) in production container
+  - Secrets: all credentials in environment variables, never in source code
+
+
+--------------------------------------------------------------------------------
+11. REAL-TIME & ASYNC INFRASTRUCTURE
+--------------------------------------------------------------------------------
+
+  SOCKET.IO (Real-time WebSockets)
+  ----------------------------------
+  - Socket.io 4.7 installed and initialized in server.ts
+  - Planned use: live proctoring dashboard for faculty
+  - Events: session status updates, violation alerts, trust score changes
+  - Infrastructure in place; event handlers pending implementation
+
+  BULLMQ + REDIS (Job Queue)
+  ---------------------------
+  - BullMQ 5.12 with ioredis for distributed job processing
+  - Planned queues:
+      * Async MCQ grading after submission
+      * Email notification dispatch
+      * Proctoring screenshot analysis
+      * Result calculation pipeline
+  - Decouples heavy operations from request-response cycle
+
+  AWS INTEGRATIONS
+  -----------------
+  - AWS S3 + S3 Request Presigner:
+      Pre-signed upload URLs for proctoring screenshots
+      Evidence stored securely; accessible only to authorized faculty
+  - AWS Rekognition:
+      Computer vision for face detection analysis
+      Processes webcam frames to detect face count, gaze direction
+
+
+--------------------------------------------------------------------------------
+12. EXAM SESSION LIFECYCLE (Data Flow)
+--------------------------------------------------------------------------------
+
+  STUDENT TAKING AN EXAM
+  -----------------------
+  1. Student enrolls via course code
+     -> Enrollment record created (studentId + courseId)
+
+  2. Student starts exam session
+     -> Checks: enrollment valid, exam window open, max attempts not exceeded
+     -> ExamSession created { status: ACTIVE, trustScore: 100.0 }
+
+  3. Questions delivered
+     -> Questions shuffled if ExamRules.shuffleQuestions = true
+     -> Options shuffled if ExamRules.shuffleChoices = true
+
+  4. Auto-save answers (every N seconds from frontend)
+     -> POST /exam-sessions/:id/answers
+     -> Upsert per questionId (safe to call multiple times)
+
+  5. Proctoring event detected (TAB_SWITCH, NO_FACE, etc.)
+     -> SuspiciousEvent record created with severity
+     -> Penalty Engine invoked:
+         - Recalculates trustScore
+         - Checks threshold breaches
+         - If threshold breached: session TERMINATED, audit logged
+
+  6. Student submits exam
+     -> ExamSession.status = SUBMITTED
+     -> Result calculated: score summed, percentage computed, pass/fail set
+     -> Result record created (1:1 with ExamSession)
+
+  FACULTY CREATING AN EXAM
+  -------------------------
+  1. Create course  -> auto-generated course code returned
+  2. Create questions individually or bulk import via JSON/CSV
+  3. Create exam with title, duration, start/end times
+  4. Attach ExamRules (proctoring thresholds, shuffle, attempts)
+  5. Add questions to exam (ordered by orderIndex)
+  6. Publish exam -> status: DRAFT -> SCHEDULED/ACTIVE
+     (Blocked if no questions attached)
+  7. Students with enrollment can now see and attempt the exam
+
+
+--------------------------------------------------------------------------------
+13. DESIGN PATTERNS SUMMARY
+--------------------------------------------------------------------------------
+
+  Pattern              | Where Applied
+  ---------------------|------------------------------------------------------
+  Layered Architecture | Routes -> Controllers -> Services -> Prisma
+  Strategy Pattern     | Passport OAuth (Google, GitHub strategies)
+  Middleware Pattern   | authenticate, authorize, Helmet, CORS chains
+  Repository Pattern   | Prisma ORM abstracts all DB operations
+  Soft Delete          | deletedAt timestamp on Questions, Exams
+  Upsert Pattern       | Answer saves, Enrollment creation
+  Factory Pattern      | Course code generation utility (with retry)
+  Observer Pattern     | Socket.io events for real-time notifications (planned)
+  Queue Pattern        | BullMQ for async job processing (planned)
+
+
+--------------------------------------------------------------------------------
+14. API VERSIONING & STRUCTURE SUMMARY
+--------------------------------------------------------------------------------
+
+  Base URL    : http://localhost:4000/api/v1/
+  Versioning  : URI-based (/api/v1/) for forward compatibility
+
+  Module          | Endpoints | Primary Roles
+  ----------------|-----------|----------------------------------------
+  /auth           |     8     | All users
+  /courses        |     6     | Faculty (write), Student (read/enroll)
+  /exams          |     8     | Faculty (write), Student (read)
+  /questions      |     6     | Faculty (write)
+  /exam-sessions  |     4     | Student (write), Faculty (read)
+  /ai             |     1     | Faculty
+  TOTAL           |    33     |
+
+  Error Response Format (consistent across all endpoints):
+  {
+    "error": "Human-readable message",
+    "details": [...] // Zod validation errors if applicable
+  }
+
+
+--------------------------------------------------------------------------------
+15. FUTURE ENHANCEMENTS (ROADMAP)
+--------------------------------------------------------------------------------
+
+  FEATURE                    | STATUS         | DEPENDENCY
+  ---------------------------|----------------|----------------------------
+  Full MFA (TOTP)            | Schema ready   | Controller implementation
+  Socket.io live dashboard   | Infra ready    | Event handler wiring
+  AWS S3 screenshot storage  | SDK ready      | Storage service module
+  AWS Rekognition face AI    | SDK ready      | Integration with proctoring
+  BullMQ async grading       | Queue ready    | Worker implementation
+  Email notifications        | Nodemailer     | Template + trigger setup
+  Auto MCQ grading           | TODO comment   | Post-submit pipeline
+  OpenAI integration         | SDK installed  | Controller implementation
+  Rate limiting per route    | Library ready  | Per-endpoint config
+
+
+================================================================================
+END OF DOCUMENT
+================================================================================

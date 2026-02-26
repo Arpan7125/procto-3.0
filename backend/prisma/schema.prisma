@@ -165,6 +165,12 @@ model ExamRules {
   allowCalculator       Boolean @default(false)
   allowFormulaSheet     Boolean @default(false)
 
+  // Proctoring Penalty Config
+  maxLowSeverityEvents    Int     @default(5)
+  maxMediumSeverityEvents Int     @default(3)
+  maxHighSeverityEvents   Int     @default(1)
+  autoTerminate           Boolean @default(true)
+
   // Relations
   exam Exam @relation(fields: [examId], references: [id], onDelete: Cascade)
 }
@@ -212,6 +218,7 @@ model ExamSession {
   submittedAt DateTime?
   status      SessionStatus @default(PENDING)
   ipAddress   String?
+  trustScore  Float?        @default(100.0)
   createdAt   DateTime      @default(now())
   updatedAt   DateTime      @updatedAt
 

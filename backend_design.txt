@@ -1,0 +1,423 @@
+================================================================================
+                    PROCTO 3.0 - BACKEND DESIGN DOCUMENT
+              AI-Powered Online Proctored Examination Platform
+================================================================================
+
+
+1. SYSTEM OVERVIEW
+--------------------------------------------------------------------------------
+
+Procto 3.0 is a full-stack online proctored examination platform. The backend
+is a RESTful API server that handles authentication, course management, exam
+lifecycle, AI-powered question generation, and real-time proctoring with
+automated integrity enforcement.
+
+Core Responsibilities:
+  - User authentication (email/password + OAuth via Google & GitHub)
+  - Role-based access control (Student, Faculty, Admin)
+  - Course and enrollment management
+  - Exam creation, scheduling, publishing, and lifecycle management
+  - Question bank with AI-powered generation (Google Gemini 2.0)
+  - Real-time proctoring: suspicious event tracking and trust scoring
+  - Automated exam termination based on configurable penalty rules
+  - AWS Rekognition integration for face detection during exams
+
+
+2. TECH STACK
+--------------------------------------------------------------------------------
+
+  Layer               Technology              Purpose
+  ------------------- ----------------------- --------------------------------
+  Runtime             Node.js 20+             Server runtime
+  Language            TypeScript 5.5          Type safety
+  Framework           Express.js 4.19         HTTP server & routing
+  Database            PostgreSQL              Primary data store
+  ORM                 Prisma 5.22             Database access & migrations
+  Auth                JWT + Passport.js       Token-based auth + OAuth
+  Password Hashing    Bcryptjs                Secure password storage
+  Validation          Zod + Express Validator  Request schema validation
+  AI Integration      Google Gemini 2.0 Flash  Question generation
+  Cloud - Storage     AWS S3                  Screenshot & evidence storage
+  Cloud - Vision      AWS Rekognition         Face detection for proctoring
+  Security            Helmet + CORS           HTTP security headers
+  Email               Nodemailer              Notification emails
+  Containerization    Docker (multi-stage)    Dev & production deployment
+
+  Prepared but not yet active:
+  - Redis (IORedis) + BullMQ  -> Job queues & caching
+  - Socket.IO                 -> Real-time WebSocket communication
+  - OpenAI API                -> Alternate AI provider
+  - Speakeasy + QRCode        -> Multi-factor authentication (TOTP)
+
+
+3. ARCHITECTURE PATTERN
+--------------------------------------------------------------------------------
+
+The backend follows a layered MVC-S (Model-View-Controller-Service) pattern:
+
+  Request Flow:
+  Client --> Express Router --> Middleware --> Controller --> Service --> Prisma --> DB
+                                   |
+                          (Auth + Validation)
+
+  Layer Breakdown:
+  +-------------------+----------------------------------------------------+
+  | Routes            | Define HTTP endpoints, attach middleware            |
+  | Middleware         | Authentication (JWT), authorization (role-check)   |
+  | Controllers        | Request parsing, response formatting, error catch  |
+  | Services           | Core business logic, external API calls            |
+  | Prisma ORM         | Database queries, schema definitions, migrations   |
+  +-------------------+----------------------------------------------------+
+
+  Directory Structure:
+  backend/
+  +-- src/
+  |   +-- controllers/     (6 controller files)
+  |   +-- routes/          (6 route files)
+  |   +-- services/        (ai.service.ts, penalty.service.ts)
+  |   +-- middleware/      (auth.middleware.ts)
+  |   +-- utils/           (passport.ts, courseCode.ts)
+  |   +-- server.ts        (main entry point)
+  +-- prisma/
+  |   +-- schema.prisma    (database schema)
+  |   +-- migrations/      (SQL migration files)
+  +-- Dockerfile
+  +-- package.json
+  +-- tsconfig.json
+
+
+4. DATABASE DESIGN
+--------------------------------------------------------------------------------
+
+The database uses PostgreSQL with Prisma ORM. Key design decisions:
+
+  a) Soft Deletes: User, Course, Question, Exam all use a `deletedAt` field
+     so data is never permanently lost (important for audit trails).
+
+  b) JSON Content Fields: Questions use a JSON `content` field to support
+     flexible question structures (MCQ options, code snippets, etc.).
+
+  c) Strategic Indexing: Indexes on frequently queried columns like
+     User.email, Course.code, Exam.status, ExamSession.studentId.
+
+  d) Unique Constraints: Prevent duplicate enrollments, duplicate exam
+     sessions, and duplicate answers per question.
+
+  Entity Relationship Summary:
+  +-----------------------------------------------------------------+
+  |  User (1) ----< Enrollment >---- (1) Course                    |
+  |  User (1) ----< ExamSession >---- (1) Exam                     |
+  |  Course (1) ----< Exam (1) ----< ExamQuestion >---- Question   |
+  |  ExamSession (1) ----< Answer >---- (1) ExamQuestion            |
+  |  ExamSession (1) ----< SuspiciousEvent                          |
+  |  Exam (1) ----< ExamRules (1)                                   |
+  |  ExamSession (1) ---- Result (1)                                |
+  +-----------------------------------------------------------------+
+
+  Models (12 total):
+  +-----------------------+----------------------------------------------+
+  | User                  | id, email, name, role, password, OAuth info  |
+  | RefreshToken          | Token hash, expiry, revocation flag          |
+  | AuditLog              | Action tracking for compliance               |
+  | Course                | name, code, description, facultyId           |
+  | Enrollment            | studentId + courseId (unique pair)            |
+  | Question              | type, content (JSON), difficulty, tags       |
+  | Exam                  | title, status, start/end times, duration     |
+  | ExamRules             | shuffle, negative marking, proctoring config |
+  | ExamQuestion          | Maps questions to exams (order preserved)    |
+  | ExamSession           | Student's exam attempt, trust score, status  |
+  | Answer                | Student response (JSON), scores              |
+  | SuspiciousEvent       | Type, severity, screenshot evidence          |
+  | Result                | Total score, percentage, rank, pass/fail     |
+  +-----------------------+----------------------------------------------+
+
+  Question Types Supported:
+  MULTIPLE_CHOICE | MULTIPLE_SELECT | TRUE_FALSE | SHORT_ANSWER |
+  ESSAY | FILL_BLANK | NUMERICAL | CODE
+
+
+5. API DESIGN
+--------------------------------------------------------------------------------
+
+All endpoints are prefixed with /api/v1.
+
+  Module              Endpoint                 Method   Description
+  ------------------- ------------------------ -------- -------------------------
+  AUTHENTICATION
+                      /auth/register           POST     Create new account
+                      /auth/login              POST     Email/password login
+                      /auth/logout             POST     Invalidate session
+                      /auth/refresh            POST     Refresh access token
+                      /auth/google             GET      Google OAuth flow
+                      /auth/github             GET      GitHub OAuth flow
+
+  COURSES
+                      /courses                 POST     Create course (Faculty)
+                      /courses                 GET      List user's courses
+                      /courses/:id             GET      Course details
+                      /courses/enroll          POST     Join by course code
+                      /courses/:id/roster      GET      Student roster (Faculty)
+                      /courses/:id/students/:s DELETE   Unenroll student
+
+  QUESTIONS
+                      /questions               POST     Create question (Faculty)
+                      /questions               GET      List by course
+                      /questions/:id           GET/PUT  Read/Update question
+                      /questions/:id           DELETE   Soft delete question
+                      /questions/import        POST     Bulk import questions
+
+  EXAMS
+                      /exams                   POST     Create exam (Faculty)
+                      /exams                   GET      List by course
+                      /exams/:id               GET/PUT  Read/Update exam
+                      /exams/:id               DELETE   Delete exam
+                      /exams/:id/publish       POST     Publish exam
+                      /exams/:id/questions     POST     Add questions to exam
+                      /exams/:id/questions/:q  DELETE   Remove question
+
+  EXAM SESSIONS
+                      /exam-sessions           POST     Start exam (Student)
+                      /exam-sessions/:id       GET      Session details
+                      /exam-sessions/:id/answers POST   Auto-save answers
+                      /exam-sessions/:id/submit POST    Submit exam
+
+  AI
+                      /ai/generate             POST     AI question generation
+
+  HEALTH
+                      /health                  GET      Service health check
+
+
+6. AUTHENTICATION & AUTHORIZATION
+--------------------------------------------------------------------------------
+
+  Authentication Flow:
+  +-----------------------------------------------------------------------+
+  |  1. User logs in with email/password OR via Google/GitHub OAuth       |
+  |  2. Server generates:                                                 |
+  |     - Access Token  (JWT, 15-min expiry, sent in response body)       |
+  |     - Refresh Token (JWT, 7-day expiry, stored as HTTP-only cookie)   |
+  |  3. Client sends Access Token in Authorization header:                |
+  |     Authorization: Bearer <access_token>                              |
+  |  4. On expiry, client calls /auth/refresh using the cookie            |
+  |  5. Server validates refresh token and issues new token pair          |
+  +-----------------------------------------------------------------------+
+
+  OAuth Flow (Google / GitHub):
+  +-----------------------------------------------------------------------+
+  |  1. Client redirects to /auth/google or /auth/github                  |
+  |  2. User authenticates with the provider                              |
+  |  3. Provider redirects back to our callback URL                       |
+  |  4. If user exists -> log in; If new -> auto-register                 |
+  |  5. Role selection via OAuth state parameter (STUDENT/FACULTY)        |
+  |  6. OAuth users are auto-verified                                     |
+  +-----------------------------------------------------------------------+
+
+  Role-Based Access Control:
+  +---------------+------------------------------------------------------+
+  | STUDENT       | Enroll in courses, take exams, view results           |
+  | FACULTY       | Create courses/exams/questions, view roster & results |
+  | ADMIN         | All faculty permissions + system administration       |
+  +---------------+------------------------------------------------------+
+
+  Security Measures:
+  - Passwords hashed with Bcryptjs (10-12 salt rounds)
+  - JWT secrets are 256-bit hex strings
+  - Refresh tokens stored as hashes in the database
+  - HTTP-only cookies prevent XSS token theft
+  - Helmet.js adds security headers (CSP, HSTS, etc.)
+  - CORS restricted to configured frontend origin
+
+
+7. AI-POWERED QUESTION GENERATION
+--------------------------------------------------------------------------------
+
+  Integration: Google Gemini 2.0 Flash (via @google/generative-ai SDK)
+
+  How It Works:
+  +-----------------------------------------------------------------------+
+  |  1. Faculty sends a prompt (topic, count, type, difficulty)           |
+  |  2. Backend constructs a structured prompt for Gemini                 |
+  |  3. Gemini returns questions in JSON format                           |
+  |  4. Backend parses and validates the response                         |
+  |  5. Questions returned to faculty for review before saving            |
+  +-----------------------------------------------------------------------+
+
+  Supported Parameters:
+  - prompt:     Free-text topic description
+  - count:      Number of questions to generate
+  - type:       MCQ | TRUE_FALSE | SUBJECTIVE | ANY
+  - difficulty: EASY | MEDIUM | HARD | ANY
+
+  Error Handling:
+  - API quota exceeded (429): User-friendly error message
+  - JSON parse failure:       Graceful fallback with mock data
+  - Network errors:           Retry-friendly messaging
+
+  Future Scope: OpenAI GPT integration (SDK already installed)
+
+
+8. PROCTORING ENGINE
+--------------------------------------------------------------------------------
+
+  The proctoring system monitors student behavior during exams and enforces
+  academic integrity through automated trust scoring and termination.
+
+  Suspicious Event Types:
+  +-------------------------+-----------+-------------------------------------+
+  | Event Type              | Severity  | Detection Method                    |
+  +-------------------------+-----------+-------------------------------------+
+  | FACE_NOT_DETECTED       | HIGH      | AWS Rekognition                     |
+  | MULTIPLE_FACES          | HIGH      | AWS Rekognition                     |
+  | LOOKING_AWAY            | MEDIUM    | AWS Rekognition                     |
+  | TAB_SWITCH              | MEDIUM    | Browser visibility API (frontend)   |
+  | SCREEN_EXIT             | MEDIUM    | Fullscreen API (frontend)           |
+  | NOISE_DETECTED          | LOW       | Audio analysis (frontend)           |
+  | COPY_PASTE              | LOW       | Clipboard API (frontend)            |
+  | RIGHT_CLICK             | LOW       | Context menu event (frontend)       |
+  +-------------------------+-----------+-------------------------------------+
+
+  Trust Score Calculation:
+  +-----------------------------------------------------------------------+
+  |  Base Score: 100                                                       |
+  |  LOW severity event:    -2.5 points each                              |
+  |  MEDIUM severity event: -10 points each                               |
+  |  HIGH severity event:   -25 points each                               |
+  |  Minimum Score: 0                                                      |
+  +-----------------------------------------------------------------------+
+
+  Auto-Termination Conditions (configurable per exam via ExamRules):
+  - Event count exceeds maximum allowed for a severity level
+  - Trust score drops below 20%
+  - When triggered: session status -> TERMINATED, audit log created
+
+  Evidence Storage:
+  - Screenshots captured at time of suspicious events
+  - Stored in AWS S3 with pre-signed URLs for faculty review
+
+
+9. EXAM LIFECYCLE
+--------------------------------------------------------------------------------
+
+  Exam Status Flow:
+  DRAFT --> SCHEDULED --> ACTIVE --> COMPLETED --> ARCHIVED
+                                       |
+                                   (auto on end time)
+
+  Session Status Flow:
+  PENDING --> ACTIVE --> SUBMITTED
+                |
+                +--> TERMINATED    (auto-termination by penalty engine)
+                +--> INVALIDATED   (manual invalidation by faculty)
+
+  Exam Creation Workflow (Faculty):
+  +-----------------------------------------------------------------------+
+  |  1. Create exam (DRAFT status)                                        |
+  |  2. Configure rules (shuffle, negative marking, proctoring levels)    |
+  |  3. Add questions from question bank (or generate via AI)             |
+  |  4. Set start/end time window                                         |
+  |  5. Publish exam (status -> SCHEDULED)                                |
+  +-----------------------------------------------------------------------+
+
+  Exam Taking Workflow (Student):
+  +-----------------------------------------------------------------------+
+  |  1. Start session -> validates: enrollment, exam window, attempts     |
+  |  2. Receive exam questions                                            |
+  |  3. Answers auto-saved periodically via /answers endpoint             |
+  |  4. Proctoring runs throughout (browser events + face detection)      |
+  |  5. Submit exam -> session finalized                                  |
+  |  6. If terminated -> session ends, student notified                   |
+  +-----------------------------------------------------------------------+
+
+
+10. CONFIGURABLE EXAM RULES
+--------------------------------------------------------------------------------
+
+  Each exam has an associated ExamRules record with these options:
+
+  +-------------------------------+--------+-----------------------------------+
+  | Rule                          | Type   | Description                       |
+  +-------------------------------+--------+-----------------------------------+
+  | shuffleQuestions              | Bool   | Randomize question order          |
+  | shuffleChoices                | Bool   | Randomize MCQ option order        |
+  | maxAttempts                   | Int    | Max exam attempts per student     |
+  | negativeMarking               | Bool   | Deduct marks for wrong answers    |
+  | negativeMarkingValue          | Float  | Points to deduct per wrong answer |
+  | passThreshold                 | Float  | Minimum % to pass                 |
+  | allowCalculator               | Bool   | Show calculator tool              |
+  | allowFormulaSheet             | Bool   | Show formula reference            |
+  | maxLowSeverityEvents          | Int    | Max low-severity before terminate |
+  | maxMediumSeverityEvents       | Int    | Max medium-severity before term.  |
+  | maxHighSeverityEvents         | Int    | Max high-severity before term.    |
+  | autoTerminateOnTrustScore     | Bool   | Enable trust-based termination    |
+  | trustScoreThreshold           | Float  | Trust score % to trigger term.    |
+  +-------------------------------+--------+-----------------------------------+
+
+
+11. DEPLOYMENT & INFRASTRUCTURE
+--------------------------------------------------------------------------------
+
+  Docker Configuration (Multi-Stage Build):
+  +-----------------------------------------------------------------------+
+  |  Stage 1 - Development:                                               |
+  |    - Uses ts-node-dev for hot-reload                                  |
+  |    - Exposes port 4000                                                |
+  |                                                                       |
+  |  Stage 2 - Builder:                                                   |
+  |    - Compiles TypeScript to JavaScript                                |
+  |    - Generates Prisma client                                          |
+  |                                                                       |
+  |  Stage 3 - Production:                                                |
+  |    - Minimal image with compiled JS only                              |
+  |    - Runs as non-root user for security                               |
+  |    - Exposes port 4000                                                |
+  +-----------------------------------------------------------------------+
+
+  Environment Variables Required:
+  - DATABASE_URL          (PostgreSQL connection string)
+  - JWT_ACCESS_SECRET     (256-bit hex)
+  - JWT_REFRESH_SECRET    (256-bit hex)
+  - GOOGLE_CLIENT_ID      (OAuth)
+  - GOOGLE_CLIENT_SECRET  (OAuth)
+  - GITHUB_CLIENT_ID      (OAuth)
+  - GITHUB_CLIENT_SECRET  (OAuth)
+  - GEMINI_API_KEY        (AI question generation)
+  - FRONTEND_URL          (CORS origin)
+  - PORT                  (Default: 4000)
+
+
+12. SECURITY SUMMARY
+--------------------------------------------------------------------------------
+
+  +---------------------------+----------------------------------------------+
+  | Threat                    | Mitigation                                   |
+  +---------------------------+----------------------------------------------+
+  | Brute-force login         | Bcrypt hashing, JWT short expiry             |
+  | XSS                       | HTTP-only cookies, Helmet CSP headers        |
+  | CSRF                      | SameSite cookies, CORS restrictions          |
+  | SQL Injection              | Prisma ORM parameterized queries             |
+  | Unauthorized access        | JWT auth + role-based authorization          |
+  | Token theft                | Short access token TTL, refresh rotation     |
+  | Exam cheating              | Multi-layered proctoring + auto-termination  |
+  | Data loss                  | Soft deletes, audit logging                  |
+  +---------------------------+----------------------------------------------+
+
+
+13. SCALABILITY CONSIDERATIONS
+--------------------------------------------------------------------------------
+
+  Current Design:
+  - Stateless API server (horizontal scaling ready)
+  - Database connection pooling via Prisma
+  - Docker containerization for orchestration (K8s ready)
+
+  Prepared for Future Scaling:
+  - Redis caching (IORedis installed) -> reduce DB load
+  - BullMQ job queues (installed) -> async processing (grading, emails)
+  - Socket.IO (installed) -> real-time exam monitoring dashboard
+  - MFA / TOTP (Speakeasy installed) -> enhanced security
+
+
+================================================================================
+                           END OF DOCUMENT
+================================================================================

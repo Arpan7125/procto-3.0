@@ -1,0 +1,378 @@
+================================================================================
+             PROCTO 3.0 - BACKEND FILE REFERENCE GUIDE
+         What each file does and what functions it contains
+================================================================================
+
+
+FILE: src/server.ts
+PURPOSE: Main entry point. Sets up the Express app, attaches all middleware
+         (Helmet, CORS, JSON parser, cookie parser, Passport), mounts all
+         route groups under /api/v1, and starts listening on port 4000.
+         Also has a /health endpoint for service health checks.
+
+--------------------------------------------------------------------------------
+
+FILE: src/index.ts
+PURPOSE: Legacy/unused starter file. Contains a basic Express "Hello World"
+         server on port 3000. Not used in production.
+
+================================================================================
+                             CONTROLLERS
+================================================================================
+
+FILE: src/controllers/auth.controller.ts
+PURPOSE: Handles user registration, login, logout, and token refresh.
+
+  FUNCTIONS:
+  - register()       : Creates a new user account. Validates email/password,
+                        hashes password with bcrypt, generates JWT access token
+                        (15 min) and refresh token (7 days), stores refresh
+                        token hash in DB, sets HTTP-only cookie.
+
+  - login()          : Authenticates with email/password. Verifies credentials,
+                        checks account is active, generates new token pair,
+                        updates lastLoginAt timestamp.
+
+  - logout()         : Clears the refresh token cookie to end the session.
+
+  - refreshToken()   : Takes the refresh token from the cookie, verifies it,
+                        and issues a new access token without re-login.
+
+--------------------------------------------------------------------------------
+
+FILE: src/controllers/course.controller.ts
+PURPOSE: Manages courses, enrollments, and class rosters.
+
+  FUNCTIONS:
+  - createCourse()       : Creates a new course with an auto-generated unique
+                            code (format: xxx-xxxx-xxx). Faculty/Admin only.
+
+  - getCourses()         : Returns courses based on role. Faculty sees courses
+                            they own. Students see courses they are enrolled in.
+
+  - getCourseById()      : Returns a single course with details (faculty info,
+                            enrollment count, exam count). Checks access rights.
+
+  - enrollByCourseCode() : Student joins a course by entering the course code.
+                            Prevents duplicates. Re-activates dropped students.
+
+  - enrollStudent()      : Legacy endpoint. Enrolls a student by course ID
+                            instead of course code.
+
+  - getCourseRoster()    : Returns the list of enrolled students for a course.
+                            Faculty/Admin only.
+
+  - unenrollStudent()    : Removes a student from a course by setting a
+                            droppedAt timestamp (soft delete). Faculty/Admin only.
+
+--------------------------------------------------------------------------------
+
+FILE: src/controllers/exam.controller.ts
+PURPOSE: Full exam lifecycle - creation, configuration, publishing, and
+         question assignment.
+
+  FUNCTIONS:
+  - createExam()             : Creates a new exam in DRAFT status. Accepts
+                                title, duration, start/end times, proctoring
+                                level, and optional exam rules (shuffle,
+                                negative marking, max attempts, etc.).
+
+  - getExams()               : Lists exams for a course. Students only see
+                                published exams. Faculty sees all.
+
+  - getExamById()            : Returns full exam details including questions
+                                (ordered by index). Students cannot see
+                                unpublished exams.
+
+  - updateExam()             : Updates exam settings. Cannot edit published
+                                exams that have already started.
+
+  - deleteExam()             : Soft-deletes an exam. Blocked if any student
+                                has already submitted.
+
+  - publishExam()            : Moves exam from DRAFT to SCHEDULED. Requires
+                                at least one question attached.
+
+  - addQuestionsToExam()     : Links questions to an exam with sequential
+                                ordering. Skips duplicates automatically.
+
+  - removeQuestionFromExam() : Unlinks a question from an exam.
+
+--------------------------------------------------------------------------------
+
+FILE: src/controllers/examSession.controller.ts
+PURPOSE: Handles the student-facing exam experience - starting, answering,
+         and submitting exams.
+
+  FUNCTIONS:
+  - startExamSession() : Student begins an exam. Validates the exam window
+                          (between startAt and endAt), checks enrollment,
+                          enforces max attempts. Resumes an existing active
+                          session if one exists. Captures student's IP address.
+
+  - saveAnswers()      : Auto-saves student answers during the exam. Uses
+                          upsert - creates new answers or updates existing
+                          ones. Answers stored as flexible JSON.
+
+  - submitExam()       : Finalizes the exam session. Sets status to SUBMITTED
+                          and records submission time. Cannot re-submit.
+
+  - getSession()       : Returns session details. Students see only their own
+                          sessions. Faculty can see any session for review.
+
+--------------------------------------------------------------------------------
+
+FILE: src/controllers/question.controller.ts
+PURPOSE: Question bank management - create, edit, import, and organize
+         questions across 8 types.
+
+  FUNCTIONS:
+  - createQuestion()   : Creates a single question. Validates differently
+                          based on type (MCQ needs options + correct answer,
+                          True/False needs "true"/"false" answer). Stores
+                          content as flexible JSON.
+
+  - getQuestions()     : Lists questions for a course. Supports filters:
+                          type, difficulty, tags. Faculty owns the course,
+                          students must be enrolled.
+
+  - getQuestionById()  : Returns a single question with course info.
+                          Faculty only.
+
+  - updateQuestion()   : Partial update of question fields (type, content,
+                          points, difficulty, tags). Faculty only.
+
+  - deleteQuestion()   : Soft-deletes a question (sets deletedAt).
+                          Faculty only.
+
+  - importQuestions()  : Bulk creates multiple questions at once. Validates
+                          all questions before inserting any. Faculty only.
+
+  Supported Question Types:
+  MULTIPLE_CHOICE | MULTIPLE_SELECT | TRUE_FALSE | SHORT_ANSWER |
+  ESSAY | FILL_BLANK | NUMERICAL | CODE
+
+--------------------------------------------------------------------------------
+
+FILE: src/controllers/ai.controller.ts
+PURPOSE: AI-powered question generation endpoint.
+
+  FUNCTIONS:
+  - generateQuestions() : Takes a text prompt, desired count (1-50),
+                           question type (MCQ/TRUE_FALSE/SUBJECTIVE/ANY),
+                           and difficulty (EASY/MEDIUM/HARD/ANY). Calls the
+                           AI service and returns generated questions.
+
+================================================================================
+                               ROUTES
+================================================================================
+
+FILE: src/routes/auth.routes.ts
+PURPOSE: Defines authentication endpoints.
+  POST   /register           -> register()
+  POST   /login              -> login()
+  POST   /logout             -> logout()
+  POST   /refresh            -> refreshToken()
+  GET    /google             -> Starts Google OAuth (role passed via state)
+  GET    /google/callback    -> Google OAuth callback (generates JWT, redirects)
+  GET    /github             -> Starts GitHub OAuth (role passed via state)
+  GET    /github/callback    -> GitHub OAuth callback (generates JWT, redirects)
+  GET    /failed             -> OAuth failure redirect
+
+--------------------------------------------------------------------------------
+
+FILE: src/routes/course.routes.ts
+PURPOSE: Defines course management endpoints. All require authentication.
+  POST   /                   -> createCourse()        [Faculty/Admin]
+  GET    /                   -> getCourses()           [All roles]
+  GET    /:id                -> getCourseById()        [All roles]
+  POST   /enroll             -> enrollByCourseCode()   [Student]
+  POST   /:id/enroll         -> enrollStudent()        [Student, legacy]
+  GET    /:id/roster         -> getCourseRoster()      [Faculty/Admin]
+  DELETE /:id/students/:sid  -> unenrollStudent()      [Faculty/Admin]
+
+--------------------------------------------------------------------------------
+
+FILE: src/routes/exam.routes.ts
+PURPOSE: Defines exam management endpoints. All require authentication.
+  POST   /                        -> createExam()              [Faculty/Admin]
+  GET    /                        -> getExams()                [All roles]
+  GET    /:id                     -> getExamById()             [All roles]
+  PUT    /:id                     -> updateExam()              [Faculty/Admin]
+  DELETE /:id                     -> deleteExam()              [Faculty/Admin]
+  POST   /:id/publish             -> publishExam()             [Faculty/Admin]
+  POST   /:id/questions           -> addQuestionsToExam()      [Faculty/Admin]
+  DELETE /:id/questions/:qid      -> removeQuestionFromExam()  [Faculty/Admin]
+
+--------------------------------------------------------------------------------
+
+FILE: src/routes/examSession.routes.ts
+PURPOSE: Defines exam session endpoints. All require authentication.
+  POST   /                   -> startExamSession()     [Student]
+  GET    /:id                -> getSession()            [All roles]
+  POST   /:id/answers        -> saveAnswers()           [Student]
+  POST   /:id/submit         -> submitExam()            [Student]
+
+--------------------------------------------------------------------------------
+
+FILE: src/routes/question.routes.ts
+PURPOSE: Defines question bank endpoints. All require authentication.
+  POST   /                   -> createQuestion()       [Faculty/Admin]
+  GET    /                   -> getQuestions()          [All roles]
+  GET    /:id                -> getQuestionById()       [All roles]
+  PUT    /:id                -> updateQuestion()        [Faculty/Admin]
+  DELETE /:id                -> deleteQuestion()        [Faculty/Admin]
+  POST   /import             -> importQuestions()       [Faculty/Admin]
+
+--------------------------------------------------------------------------------
+
+FILE: src/routes/ai.routes.ts
+PURPOSE: Defines AI question generation endpoint. Requires authentication.
+  POST   /generate           -> generateQuestions()    [Authenticated]
+
+================================================================================
+                              MIDDLEWARE
+================================================================================
+
+FILE: src/middleware/auth.middleware.ts
+PURPOSE: Authentication and authorization middleware for protecting routes.
+
+  FUNCTIONS:
+  - authenticate()       : Extracts JWT from Authorization header, verifies
+                            signature, checks user exists and is active in DB,
+                            attaches user info (userId, role) to the request.
+                            Returns 401 if token is missing, invalid, or
+                            user is inactive.
+
+  - authorize(roles[])   : Takes an array of allowed roles (e.g., ['FACULTY',
+                            'ADMIN']). Returns 403 if the user's role is not
+                            in the allowed list. Must run after authenticate().
+
+================================================================================
+                              SERVICES
+================================================================================
+
+FILE: src/services/ai.service.ts
+PURPOSE: Handles communication with Google Gemini AI for question generation.
+
+  FUNCTIONS:
+  - generateQuestionsFromAI(prompt, count, type, difficulty)
+      Builds a structured prompt asking Gemini 2.0 Flash to generate exam
+      questions in JSON format. Cleans markdown from the response, parses
+      the JSON, and returns an array of questions. Falls back to mock
+      questions if GEMINI_API_KEY is not set. Handles API quota errors (429)
+      with a user-friendly message.
+
+--------------------------------------------------------------------------------
+
+FILE: src/services/penalty.service.ts
+PURPOSE: Proctoring penalty engine that calculates trust scores and
+         auto-terminates exam sessions.
+
+  CLASS: PenaltyEngine (static methods)
+
+  FUNCTIONS:
+  - processEvent(sessionId)
+      Fetches all suspicious events for an exam session, counts them by
+      severity, and calculates a trust score:
+
+        Trust Score = 100 - (LOW * 2.5) - (MEDIUM * 10) - (HIGH * 25)
+
+      Checks auto-termination conditions:
+        - LOW events exceed max allowed
+        - MEDIUM events exceed max allowed
+        - HIGH events exceed max allowed
+        - Trust score falls below 20%
+
+      If termination triggered: sets session status to TERMINATED, records
+      submission time, creates an audit log entry. Returns the updated
+      session, whether termination happened, the reason, and the score.
+
+================================================================================
+                              UTILITIES
+================================================================================
+
+FILE: src/utils/passport.ts
+PURPOSE: Configures Passport.js OAuth strategies for Google and GitHub.
+
+  Google OAuth Strategy:
+    - Uses GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET
+    - On callback: finds or creates user, links Google account if user
+      exists by email, extracts name and profile photo, sets isVerified=true
+    - Role determined by the state parameter (STUDENT or FACULTY)
+
+  GitHub OAuth Strategy:
+    - Uses GITHUB_CLIENT_ID and GITHUB_CLIENT_SECRET
+    - Same flow as Google. If GitHub has no email, generates a fallback
+      email as username@github.local
+    - Parses displayName or username for first/last name
+
+  Serialize/Deserialize:
+    - Stores user.id in session, looks up user by ID on deserialize
+
+--------------------------------------------------------------------------------
+
+FILE: src/utils/courseCode.ts
+PURPOSE: Generates unique, shareable course codes.
+
+  FUNCTIONS:
+  - generateCourseCode()
+      Returns a random code in the format xxx-xxxx-xxx (like Google
+      Classroom). Uses lowercase letters and digits. The caller checks
+      for uniqueness in the database (up to 10 retries).
+
+================================================================================
+                          DATABASE SCHEMA
+================================================================================
+
+FILE: prisma/schema.prisma
+PURPOSE: Defines all database models, relationships, indexes, and enums
+         for PostgreSQL via Prisma ORM.
+
+  MODELS (13):
+  - User              : Accounts with roles (STUDENT/FACULTY/ADMIN), OAuth
+  - RefreshToken       : JWT refresh token storage with hashes
+  - AuditLog           : Tracks system actions for compliance
+  - Course             : Faculty-owned courses with unique codes
+  - Enrollment         : Student-course join table (soft-deletable)
+  - Question           : Question bank with JSON content field
+  - Exam               : Exam configuration and scheduling
+  - ExamRules          : Per-exam settings (shuffle, penalties, thresholds)
+  - ExamQuestion       : Links questions to exams with ordering
+  - ExamSession        : Student exam attempts with trust scores
+  - Answer             : Student responses (JSON) with scores
+  - SuspiciousEvent    : Proctoring event records with screenshots
+  - Result             : Final scores, percentages, rank, pass/fail
+
+  ENUMS:
+  - UserRole           : STUDENT, FACULTY, ADMIN
+  - QuestionType       : MULTIPLE_CHOICE, MULTIPLE_SELECT, TRUE_FALSE, etc.
+  - ExamStatus         : DRAFT, SCHEDULED, ACTIVE, COMPLETED, ARCHIVED
+  - SessionStatus      : PENDING, ACTIVE, SUBMITTED, TERMINATED, INVALIDATED
+  - EventType          : FACE_NOT_DETECTED, MULTIPLE_FACES, TAB_SWITCH, etc.
+  - Severity           : LOW, MEDIUM, HIGH
+
+================================================================================
+                         CONFIGURATION FILES
+================================================================================
+
+FILE: package.json
+PURPOSE: Project dependencies and scripts. Key scripts:
+  - dev       : Runs server with ts-node-dev (hot reload)
+  - build     : Compiles TypeScript
+  - start     : Runs compiled JS in production
+  - migrate   : Runs Prisma migrations
+  - generate  : Generates Prisma client
+
+FILE: tsconfig.json
+PURPOSE: TypeScript compiler configuration.
+
+FILE: Dockerfile
+PURPOSE: Multi-stage Docker build (dev / builder / production).
+
+FILE: .env
+PURPOSE: Environment variables (DB URL, JWT secrets, OAuth keys, API keys).
+
+================================================================================
+                          END OF DOCUMENT
+================================================================================
